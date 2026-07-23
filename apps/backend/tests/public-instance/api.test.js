@@ -17,11 +17,34 @@ import {
 import { data_stats, normalizeSvg } from "../utils.js";
 
 const mock = new MockAdapter(axios);
+const repositoryStarCounts = new Map([
+  ["repo-keep-1", 1500],
+  ["repo-exclude-me", 9999],
+  ["repo-keep-2", 2600],
+]);
 
 const createResponse = () => ({
   end: vi.fn(),
   setHeader: vi.fn(),
 });
+
+const replyWithStats = (config) => {
+  const requestBody = JSON.parse(config.data);
+  if (requestBody.query.includes("repositoryStars")) {
+    return [
+      200,
+      {
+        data: {
+          node: {
+            stargazerCount:
+              repositoryStarCounts.get(requestBody.variables.id) ?? 0,
+          },
+        },
+      },
+    ];
+  }
+  return [200, data_stats];
+};
 
 beforeEach(() => {
   vi.stubEnv("CACHE_SECONDS", "");
@@ -29,7 +52,7 @@ beforeEach(() => {
   vi.stubEnv("POSTGRES_URL", "");
   vi.stubEnv("WHITELIST", "");
 
-  mock.onPost("https://api.github.com/graphql").reply(200, data_stats);
+  mock.onPost("https://api.github.com/graphql").reply(replyWithStats);
 });
 
 beforeAll(() => {
@@ -69,8 +92,6 @@ describe("Test /api contract", () => {
   });
 
   it("should match the public many-params response snapshot", async () => {
-    mock.onPost("https://api.github.com/graphql").reply(200, data_stats);
-
     const { default: router } = await import("../../router.js");
 
     const params = new URLSearchParams({

@@ -26,9 +26,9 @@ export const data_stats = {
       repositories: {
         totalCount: 3,
         nodes: [
-          { name: "repo-keep-1", stargazers: { totalCount: 1500 } },
-          { name: "repo-exclude-me", stargazers: { totalCount: 9999 } },
-          { name: "repo-keep-2", stargazers: { totalCount: 2600 } },
+          { id: "repo-keep-1", name: "repo-keep-1" },
+          { id: "repo-exclude-me", name: "repo-exclude-me" },
+          { id: "repo-keep-2", name: "repo-keep-2" },
         ],
         pageInfo: {
           hasNextPage: false,

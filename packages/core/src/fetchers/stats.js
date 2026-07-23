@@ -15,14 +15,22 @@ const GRAPHQL_REPOS_FIELD = `
   repositories(first: 100, after: $after, ownerAffiliations: $ownerAffiliations, orderBy: {direction: DESC, field: STARGAZERS}) {
     totalCount
     nodes {
+      id
       name
-      stargazers {
-        totalCount
-      }
     }
     pageInfo {
       hasNextPage
       endCursor
+    }
+  }
+`;
+
+const GRAPHQL_REPO_STARS_QUERY = `
+  query repositoryStars($id: ID!) {
+    node(id: $id) {
+      ... on Repository {
+        stargazerCount
+      }
     }
   }
 `;
@@ -96,6 +104,25 @@ const fetcher = (variables, token) => {
 };
 
 /**
+ * Fetch the star count for one repository.
+ *
+ * @param {{ id: string }} variables Fetcher variables.
+ * @param {string} token GitHub token.
+ * @returns {Promise<import('axios').AxiosResponse>} Axios response.
+ */
+const repoStarsFetcher = (variables, token) => {
+  return request(
+    {
+      query: GRAPHQL_REPO_STARS_QUERY,
+      variables,
+    },
+    {
+      Authorization: `bearer ${token}`,
+    },
+  );
+};
+
+/**
  * Fetch stats information for a given username.
  *
  * @param {object} variables Fetcher variables.
@@ -139,24 +166,49 @@ const statsFetcher = async ({
       return res;
     }
 
-    // Store stats data.
-    const repoNodes = res.data.data.user.repositories.nodes;
-    if (stats) {
-      if (fetchedPages === 1) {
-        // make deep copy of relevant stats fields to avoid altering the cached response object in frontend
-        stats = structuredClone({
-          data: stats.data,
-          statusText: stats.statusText,
-        });
+    const repoNodes = [];
+    for (const repoNode of res.data.data.user.repositories.nodes) {
+      const starsResponse = await retryer(
+        repoStarsFetcher,
+        { id: repoNode.id },
+        pat,
+      );
+      if (starsResponse.data.errors) {
+        return starsResponse;
       }
+      repoNodes.push({
+        ...repoNode,
+        stargazerCount: starsResponse.data.data.node?.stargazerCount ?? 0,
+      });
+    }
+
+    const pageResponse = {
+      ...res,
+      data: {
+        ...res.data,
+        data: {
+          ...res.data.data,
+          user: {
+            ...res.data.data.user,
+            repositories: {
+              ...res.data.data.user.repositories,
+              nodes: repoNodes,
+            },
+          },
+        },
+      },
+    };
+
+    // Store stats data.
+    if (stats) {
       stats.data.data.user.repositories.nodes.push(...repoNodes);
     } else {
-      stats = res;
+      stats = pageResponse;
     }
 
     fetchedPages++;
     const repoNodesWithStars = repoNodes.filter(
-      (node) => node.stargazers.totalCount !== 0,
+      (node) => node.stargazerCount !== 0,
     );
 
     hasNextPage =
@@ -455,7 +507,7 @@ const fetchStats = async (
       return !repoToHide.has(data.name);
     })
     .reduce((prev, curr) => {
-      return prev + curr.stargazers.totalCount;
+      return prev + curr.stargazerCount;
     }, 0);
 
   stats.rank = calculateRank({

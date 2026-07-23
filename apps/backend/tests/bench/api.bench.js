@@ -5,6 +5,11 @@ import { beforeAll, bench, describe, vi } from "vitest";
 import { data_stats } from "../utils.js";
 
 const mock = new MockAdapter(axios);
+const repositoryStarCounts = new Map([
+  ["repo-keep-1", 1500],
+  ["repo-exclude-me", 9999],
+  ["repo-keep-2", 2600],
+]);
 
 const createResponse = () => ({
   end: vi.fn(),
@@ -21,7 +26,23 @@ beforeAll(async () => {
 
   ({ default: router } = await import("../../router.js"));
 
-  mock.onPost("https://api.github.com/graphql").reply(200, data_stats);
+  mock.onPost("https://api.github.com/graphql").reply((config) => {
+    const requestBody = JSON.parse(config.data);
+    if (requestBody.query.includes("repositoryStars")) {
+      return [
+        200,
+        {
+          data: {
+            node: {
+              stargazerCount:
+                repositoryStarCounts.get(requestBody.variables.id) ?? 0,
+            },
+          },
+        },
+      ];
+    }
+    return [200, data_stats];
+  });
 });
 
 describe("bench /api", () => {

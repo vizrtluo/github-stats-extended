@@ -33,9 +33,9 @@ const data_stats = {
       repositories: {
         totalCount: 3,
         nodes: [
-          { name: "test-repo-1", stargazers: { totalCount: 100 } },
-          { name: "test-repo-2", stargazers: { totalCount: 100 } },
-          { name: "test-repo-3", stargazers: { totalCount: 100 } },
+          { id: "repo-1", name: "test-repo-1" },
+          { id: "repo-2", name: "test-repo-2" },
+          { id: "repo-3", name: "test-repo-3" },
         ],
         pageInfo: {
           hasNextPage: true,
@@ -64,8 +64,8 @@ const data_repo = {
     user: {
       repositories: {
         nodes: [
-          { name: "test-repo-4", stargazers: { totalCount: 50 } },
-          { name: "test-repo-5", stargazers: { totalCount: 50 } },
+          { id: "repo-4", name: "test-repo-4" },
+          { id: "repo-5", name: "test-repo-5" },
         ],
         pageInfo: {
           hasNextPage: false,
@@ -82,11 +82,11 @@ const data_repo_zero_stars = {
       repositories: {
         totalCount: 5,
         nodes: [
-          { name: "test-repo-1", stargazers: { totalCount: 100 } },
-          { name: "test-repo-2", stargazers: { totalCount: 100 } },
-          { name: "test-repo-3", stargazers: { totalCount: 100 } },
-          { name: "test-repo-4", stargazers: { totalCount: 0 } },
-          { name: "test-repo-5", stargazers: { totalCount: 0 } },
+          { id: "repo-1", name: "test-repo-1" },
+          { id: "repo-2", name: "test-repo-2" },
+          { id: "repo-3", name: "test-repo-3" },
+          { id: "repo-zero-4", name: "test-repo-4" },
+          { id: "repo-zero-5", name: "test-repo-5" },
         ],
         pageInfo: {
           hasNextPage: true,
@@ -109,6 +109,15 @@ const error = {
 };
 
 const mock = new MockAdapter(axios);
+const repositoryStarCounts = new Map([
+  ["repo-1", 100],
+  ["repo-2", 100],
+  ["repo-3", 100],
+  ["repo-4", 50],
+  ["repo-5", 50],
+  ["repo-zero-4", 0],
+  ["repo-zero-5", 0],
+]);
 
 beforeEach(() => {
   process.env.FETCH_MULTI_PAGE_STARS = "false"; // Set to `false` to fetch only one page of stars.
@@ -122,6 +131,18 @@ beforeEach(() => {
       req.variables.startTime.startsWith("2003")
     ) {
       return [200, data_year2003];
+    }
+    if (req.query.includes("repositoryStars")) {
+      return [
+        200,
+        {
+          data: {
+            node: {
+              stargazerCount: repositoryStarCounts.get(req.variables.id) ?? 0,
+            },
+          },
+        },
+      ];
     }
     return [
       200,
@@ -169,13 +190,70 @@ describe("Test fetchStats", () => {
     });
   });
 
-  it("should stop fetching when there are repos with zero stars", async () => {
+  it("should fetch repository star counts in series", async () => {
+    const dataWithoutStarConnections = structuredClone(data_stats);
+    dataWithoutStarConnections.data.user.repositories.nodes = [
+      { id: "repo-1", name: "test-repo-1" },
+      { id: "repo-2", name: "test-repo-2" },
+      { id: "repo-3", name: "test-repo-3" },
+    ];
+    let activeStarRequests = 0;
+    let maxActiveStarRequests = 0;
+    const queriedRepositoryIds = [];
+
     mock.reset();
-    mock
-      .onPost("https://api.github.com/graphql")
-      .replyOnce(200, data_stats)
-      .onPost("https://api.github.com/graphql")
-      .replyOnce(200, data_repo_zero_stars);
+    mock.onPost("https://api.github.com/graphql").reply(async (config) => {
+      const requestBody = JSON.parse(config.data);
+      if (requestBody.query.includes("repositoryStars")) {
+        activeStarRequests++;
+        maxActiveStarRequests = Math.max(
+          maxActiveStarRequests,
+          activeStarRequests,
+        );
+        queriedRepositoryIds.push(requestBody.variables.id);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        activeStarRequests--;
+        return [200, { data: { node: { stargazerCount: 100 } } }];
+      }
+
+      expect(requestBody.query).not.toContain("stargazers {");
+      return [200, dataWithoutStarConnections];
+    });
+
+    const stats = await fetchStats("anuraghazra");
+
+    expect(stats.totalStars).toBe(300);
+    expect(queriedRepositoryIds).toStrictEqual(["repo-1", "repo-2", "repo-3"]);
+    expect(maxActiveStarRequests).toBe(1);
+  });
+
+  it("should stop fetching when there are repos with zero stars", async () => {
+    process.env.FETCH_MULTI_PAGE_STARS = "true";
+    loadConfigFromEnv();
+    const dataStatsWithZeroStars = structuredClone(data_stats);
+    dataStatsWithZeroStars.data.user.repositories =
+      data_repo_zero_stars.data.user.repositories;
+    let repositoryPageRequests = 0;
+
+    mock.reset();
+    mock.onPost("https://api.github.com/graphql").reply((config) => {
+      const requestBody = JSON.parse(config.data);
+      if (requestBody.query.includes("repositoryStars")) {
+        return [
+          200,
+          {
+            data: {
+              node: {
+                stargazerCount:
+                  repositoryStarCounts.get(requestBody.variables.id) ?? 0,
+              },
+            },
+          },
+        ];
+      }
+      repositoryPageRequests++;
+      return [200, dataStatsWithZeroStars];
+    });
 
     let stats = await fetchStats("anuraghazra");
     const rank = calculateRank({
@@ -208,6 +286,7 @@ describe("Test fetchStats", () => {
       totalIssuesCommented: 0,
       rank,
     });
+    expect(repositoryPageRequests).toBe(1);
   });
 
   it("should throw error", async () => {
@@ -540,9 +619,23 @@ describe("Test fetchStats", () => {
   });
 
   it("should return correct data when user don't have any pull requests", async () => {
-    mock
-      .onPost("https://api.github.com/graphql")
-      .reply(200, data_without_pull_requests);
+    mock.onPost("https://api.github.com/graphql").reply((config) => {
+      const requestBody = JSON.parse(config.data);
+      if (requestBody.query.includes("repositoryStars")) {
+        return [
+          200,
+          {
+            data: {
+              node: {
+                stargazerCount:
+                  repositoryStarCounts.get(requestBody.variables.id) ?? 0,
+              },
+            },
+          },
+        ];
+      }
+      return [200, data_without_pull_requests];
+    });
     const stats = await fetchStats("anuraghazra", false, [], true);
     const rank = calculateRank({
       all_commits: false,
