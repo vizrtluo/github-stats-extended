@@ -41,11 +41,18 @@ jobs:
           core_version: 2.1.3
           fail_on_error: true
 
-      - name: Commit cards
+      - name: Publish cards
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          export GIT_INDEX_FILE="${RUNNER_TEMP}/profile-cards-index"
+          rm -f "${GIT_INDEX_FILE}"
+          git read-tree --empty
           git add dist/stats.svg dist/top-langs.svg
-          git diff --cached --quiet && exit 0
-          git commit -m "chore: update profile cards"
-          git push
+          tree="$(git write-tree)"
+          if git fetch --depth=1 origin profile-cards; then
+            previous_tree="$(git rev-parse 'FETCH_HEAD^{tree}')"
+            test "${tree}" = "${previous_tree}" && exit 0
+          fi
+          commit="$(printf '%s\n' "chore: update profile cards" | git commit-tree "${tree}")"
+          git push --force origin "${commit}:refs/heads/profile-cards"
