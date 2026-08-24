@@ -51,10 +51,10 @@ const networkError = (): Error => {
   });
 };
 
-const httpError = (status: number): Error => {
+const httpError = (status: number, message = ""): Error => {
   return Object.assign(new Error("http error"), {
     isAxiosError: true,
-    response: { status, data: {} },
+    response: { status, data: { message } },
   });
 };
 
@@ -113,28 +113,55 @@ describe("Test Retryer", () => {
     expect(res).toStrictEqual({ data: "ok" });
   });
 
-  it("retryer should retry retryable HTTP statuses on the same PAT", async () => {
-    const fetcher502 = vi
+  it.each([
+    [502, true],
+    [503, true],
+    [504, true],
+    // a rate limit: rotate instead of quick-retrying
+    [429, false],
+  ])("HTTP %i: quick retry = %s", async (status, shouldRetry) => {
+    const fetcherByStatus = vi
       .fn()
-      .mockRejectedValueOnce(httpError(502))
-      .mockResolvedValue({ data: "ok" }) as unknown as Fetcher;
+      .mockRejectedValueOnce(httpError(status))
+      .mockResolvedValue({ data: "ok" });
 
-    const res = await retryer(fetcher502, {}, "user-pat-token", {
-      transientRetryDelaysMs: [0],
-    });
+    if (shouldRetry) {
+      const res = await retryer(
+        fetcherByStatus as unknown as Fetcher,
+        {},
+        "user-pat-token",
+        { transientRetryDelaysMs: [0] },
+      );
 
-    expect(fetcher502).toHaveBeenCalledTimes(2);
-    expect(res).toStrictEqual({ data: "ok" });
+      expect(fetcherByStatus).toHaveBeenCalledTimes(2);
+      expect(res).toStrictEqual({ data: "ok" });
+    } else {
+      await expect(
+        retryer(fetcherByStatus as unknown as Fetcher, {}, "user-pat-token", {
+          transientRetryDelaysMs: [0],
+        }),
+      ).rejects.toThrow("Downtime due to GitHub API rate limiting");
+
+      expect(fetcherByStatus).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("retryer should treat a rate-limit 403 like a rate limit", async () => {
+    const fetcher403 = vi
+      .fn()
+      .mockRejectedValue(httpError(403, "API rate limit exceeded for ..."));
+
+    await expect(
+      retryer(fetcher403 as unknown as Fetcher, {}, "user-pat-token", {
+        transientRetryDelaysMs: [0],
+      }),
+    ).rejects.toThrow("Downtime due to GitHub API rate limiting");
+
+    expect(fetcher403).toHaveBeenCalledTimes(1);
   });
 
   it("retryer should not retry non-retryable HTTP statuses", async () => {
-    const response = { status: 404, data: { message: "Not Found" } };
-    const fetcher404 = vi.fn().mockRejectedValue(
-      Object.assign(new Error("http error"), {
-        isAxiosError: true,
-        response,
-      }),
-    );
+    const fetcher404 = vi.fn().mockRejectedValue(httpError(404, "Not Found"));
 
     const res = await retryer(
       fetcher404 as unknown as Fetcher,
@@ -144,7 +171,7 @@ describe("Test Retryer", () => {
     );
 
     expect(fetcher404).toHaveBeenCalledTimes(1);
-    expect(res).toStrictEqual(response);
+    expect(res).toStrictEqual({ status: 404, data: { message: "Not Found" } });
   });
 
   it("retryer should throw non-axios errors immediately without retrying", async () => {
@@ -161,22 +188,8 @@ describe("Test Retryer", () => {
     expect(fetcherBug).toHaveBeenCalledTimes(1);
   });
 
-  it("retryer should mention the last transient error when retries are exhausted", async () => {
+  it("retryer should report the transient cause without claiming rate limiting", async () => {
     const fetcherAlwaysFails = vi.fn().mockRejectedValue(networkError());
-
-    await expect(
-      retryer(fetcherAlwaysFails as unknown as Fetcher, {}, "user-pat-token", {
-        transientRetryDelaysMs: [],
-      }),
-    ).rejects.toThrow(
-      "GitHub API request failed after transient retries: network error",
-    );
-
-    expect(fetcherAlwaysFails).toHaveBeenCalledTimes(1);
-  });
-
-  it("retryer should not claim rate limiting when only transient errors occurred", async () => {
-    const fetcherAlwaysFails = vi.fn().mockRejectedValue(httpError(503));
 
     const promise = retryer(
       fetcherAlwaysFails as unknown as Fetcher,
@@ -186,81 +199,39 @@ describe("Test Retryer", () => {
     );
 
     await expect(promise).rejects.toThrow(
-      /GitHub API request failed after transient retries/,
+      "GitHub API request failed after transient retries: network error",
     );
     await expect(promise).rejects.not.toThrow(/rate limiting/i);
+    expect(fetcherAlwaysFails).toHaveBeenCalledTimes(1);
   });
 
-  it("retryer should report rate limiting when the last rotation hit a rate limit", async () => {
-    // pin the rotation start to the first PAT
-    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
-    const fetcherMixed = vi.fn((_vars, _token, retries) => {
-      if (retries === 0) {
-        return Promise.reject(networkError());
-      }
-      return Promise.resolve({ data: { errors: [{ type: "RATE_LIMITED" }] } });
-    }) as unknown as Fetcher;
+  it.each([
+    ["rate-limit", /rate limiting/],
+    ["credential", /invalid credentials/],
+  ])(
+    "mixed rotation starting transient and ending in %s reports the last kind",
+    async (lastKind, expectedMessage) => {
+      // pin the rotation start to the first PAT
+      const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
+      const scriptedFetcher = vi.fn((_vars, _token, retries) => {
+        if (retries === 0) {
+          return Promise.reject(networkError());
+        }
+        if (lastKind === "credential") {
+          // GitHub answers 401 for bad credentials, so axios rejects
+          return Promise.reject(httpError(401, "Bad credentials"));
+        }
+        return Promise.resolve({
+          data: { errors: [{ type: "RATE_LIMITED" }] },
+        });
+      }) as unknown as Fetcher;
 
-    await expect(
-      retryer(fetcherMixed, {}, undefined, { transientRetryDelaysMs: [] }),
-    ).rejects.toThrow("Downtime due to GitHub API rate limiting");
+      await expect(
+        retryer(scriptedFetcher, {}, undefined, { transientRetryDelaysMs: [] }),
+      ).rejects.toThrow(expectedMessage);
 
-    expect(fetcherMixed).toHaveBeenCalledTimes(2);
-    randomSpy.mockRestore();
-  });
-
-  it("retryer should report credential failure when the last rotation had bad credentials", async () => {
-    // pin the rotation start to the first PAT
-    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
-    const fetcherMixed = vi.fn((_vars, _token, retries) => {
-      if (retries === 0) {
-        return Promise.reject(networkError());
-      }
-      // GitHub answers 401 for bad credentials, so axios rejects
-      return Promise.reject(
-        Object.assign(new Error("http error"), {
-          isAxiosError: true,
-          response: { status: 401, data: { message: "Bad credentials" } },
-        }),
-      );
-    }) as unknown as Fetcher;
-
-    await expect(
-      retryer(fetcherMixed, {}, undefined, { transientRetryDelaysMs: [] }),
-    ).rejects.toThrow("GitHub API request failed due to invalid credentials");
-
-    randomSpy.mockRestore();
-  });
-
-  it("retryer should not quick-retry HTTP 429 and report rate limiting", async () => {
-    const fetcher429 = vi.fn().mockRejectedValue(httpError(429));
-
-    await expect(
-      retryer(fetcher429 as unknown as Fetcher, {}, "user-pat-token", {
-        transientRetryDelaysMs: [0],
-      }),
-    ).rejects.toThrow("Downtime due to GitHub API rate limiting");
-
-    expect(fetcher429).toHaveBeenCalledTimes(1);
-  });
-
-  it("retryer should treat a rate-limit 403 like a rate limit", async () => {
-    const fetcher403 = vi.fn().mockRejectedValue(
-      Object.assign(new Error("http error"), {
-        isAxiosError: true,
-        response: {
-          status: 403,
-          data: { message: "API rate limit exceeded for ..." },
-        },
-      }),
-    );
-
-    await expect(
-      retryer(fetcher403 as unknown as Fetcher, {}, "user-pat-token", {
-        transientRetryDelaysMs: [0],
-      }),
-    ).rejects.toThrow("Downtime due to GitHub API rate limiting");
-
-    expect(fetcher403).toHaveBeenCalledTimes(1);
-  });
+      expect(scriptedFetcher).toHaveBeenCalledTimes(2);
+      randomSpy.mockRestore();
+    },
+  );
 });
