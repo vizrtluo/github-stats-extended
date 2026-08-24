@@ -61,7 +61,14 @@ const parseArgs = (args) => {
 const writeCard = async ({ handler, options, output, token }) => {
   const result = await handler(options, token);
   if (result.status !== "success") {
-    throw new Error(`Card generation failed with status: ${result.status}`);
+    const detail = [result.error?.type, result.error?.message]
+      .filter(Boolean)
+      .join(": ");
+    throw new Error(
+      detail
+        ? `Card generation failed (${result.status}): ${detail}`
+        : `Card generation failed with status: ${result.status}`,
+    );
   }
   await mkdir(path.dirname(output), { recursive: true });
   await writeFile(output, result.content, "utf8");
