@@ -44,6 +44,20 @@ const customFetcher = vi.fn((_variables: unknown, token: string) => {
   return Promise.resolve({ data: { token } });
 }) as unknown as Fetcher;
 
+const networkError = (): Error => {
+  return Object.assign(new Error("network error"), {
+    isAxiosError: true,
+    code: "ECONNRESET",
+  });
+};
+
+const httpError = (status: number): Error => {
+  return Object.assign(new Error("http error"), {
+    isAxiosError: true,
+    response: { status, data: {} },
+  });
+};
+
 describe("Test Retryer", () => {
   it("retryer should return value and have zero retries on first try", async () => {
     const res = await retryer(fetcher, {});
@@ -83,5 +97,79 @@ describe("Test Retryer", () => {
       0,
     );
     expect(res).toStrictEqual({ data: { token: "user-pat-token" } });
+  });
+
+  it("retryer should retry transient network errors on the same PAT", async () => {
+    const fetcherTransient = vi
+      .fn()
+      .mockRejectedValueOnce(networkError())
+      .mockResolvedValue({ data: "ok" }) as unknown as Fetcher;
+
+    const res = await retryer(fetcherTransient, {}, "user-pat-token", {
+      transientRetryDelaysMs: [0],
+    });
+
+    expect(fetcherTransient).toHaveBeenCalledTimes(2);
+    expect(res).toStrictEqual({ data: "ok" });
+  });
+
+  it("retryer should retry retryable HTTP statuses on the same PAT", async () => {
+    const fetcher502 = vi
+      .fn()
+      .mockRejectedValueOnce(httpError(502))
+      .mockResolvedValue({ data: "ok" }) as unknown as Fetcher;
+
+    const res = await retryer(fetcher502, {}, "user-pat-token", {
+      transientRetryDelaysMs: [0],
+    });
+
+    expect(fetcher502).toHaveBeenCalledTimes(2);
+    expect(res).toStrictEqual({ data: "ok" });
+  });
+
+  it("retryer should not retry non-retryable HTTP statuses", async () => {
+    const response = { status: 404, data: { message: "Not Found" } };
+    const fetcher404 = vi.fn().mockRejectedValue(
+      Object.assign(new Error("http error"), {
+        isAxiosError: true,
+        response,
+      }),
+    );
+
+    const res = await retryer(
+      fetcher404 as unknown as Fetcher,
+      {},
+      "user-pat-token",
+      { transientRetryDelaysMs: [0] },
+    );
+
+    expect(fetcher404).toHaveBeenCalledTimes(1);
+    expect(res).toStrictEqual(response);
+  });
+
+  it("retryer should throw non-axios errors immediately without retrying", async () => {
+    const fetcherBug = vi
+      .fn()
+      .mockRejectedValue(new TypeError("boom")) as unknown as Fetcher;
+
+    await expect(
+      retryer(fetcherBug, {}, "user-pat-token", {
+        transientRetryDelaysMs: [0],
+      }),
+    ).rejects.toThrow("boom");
+
+    expect(fetcherBug).toHaveBeenCalledTimes(1);
+  });
+
+  it("retryer should mention the last transient error when retries are exhausted", async () => {
+    const fetcherAlwaysFails = vi.fn().mockRejectedValue(networkError());
+
+    await expect(
+      retryer(fetcherAlwaysFails as unknown as Fetcher, {}, "user-pat-token", {
+        transientRetryDelaysMs: [],
+      }),
+    ).rejects.toThrow("last transient error: network error");
+
+    expect(fetcherAlwaysFails).toHaveBeenCalledTimes(1);
   });
 });
