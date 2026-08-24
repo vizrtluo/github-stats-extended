@@ -42,10 +42,10 @@ const TRANSIENT_RETRY_JITTER_MS = 250;
 
 /**
  * HTTP statuses worth a same-token retry. Server-side blips only.
- * 429 and rate-limit 403 answers go through the rate-limit path instead:
- * GitHub expects clients to honor Retry-After or the reset time there, and
- * quick retries against a limited token can get the token blocked.
- * Permanent statuses such as 401/404/422 stay outside this set.
+ * 429 and rate-limit 403 answers skip quick retries entirely: hammering a
+ * limited token violates GitHub's Retry-After / reset guidance and can get
+ * the token blocked. Permanent statuses such as 401/404/422 stay outside
+ * this set.
  */
 const RETRYABLE_HTTP_STATUS_CODES = new Set([502, 503, 504]);
 
@@ -154,10 +154,10 @@ const retryer = async <TData = unknown>(
           message?: unknown;
         };
 
-        // Rate-limit responses never get quick retries. GitHub expects
-        // clients to honor Retry-After or the reset time, so the only safe
-        // move is to rotate to the next PAT. HTTP 429 and rate-limit 403
-        // answers both carry this meaning.
+        // Rate-limit responses never get quick retries. Quick retries would
+        // violate GitHub's Retry-After / reset guidance and can get the
+        // token blocked, so rotate to the next PAT instead. HTTP 429 and
+        // rate-limit 403 answers both carry this meaning.
         const status = e.response?.status;
         const carriesRateLimitMessage = /rate limit/i.test(
           e.response?.data.message ?? "",
