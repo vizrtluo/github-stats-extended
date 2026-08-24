@@ -41,10 +41,13 @@ const TRANSIENT_RETRY_DELAYS_MS = [1000, 2000, 4000];
 const TRANSIENT_RETRY_JITTER_MS = 250;
 
 /**
- * HTTP statuses worth a same-token retry.
- * 401/404/422 are permanent failures, so they stay outside this set.
+ * HTTP statuses worth a same-token retry. Server-side blips only.
+ * 429 and rate-limit 403 answers go through the rate-limit path instead:
+ * GitHub expects clients to honor Retry-After or the reset time there, and
+ * quick retries against a limited token can get the token blocked.
+ * Permanent statuses such as 401/404/422 stay outside this set.
  */
-const RETRYABLE_HTTP_STATUS_CODES = new Set([429, 502, 503, 504]);
+const RETRYABLE_HTTP_STATUS_CODES = new Set([502, 503, 504]);
 
 /**
  * Wait for `ms` milliseconds.
@@ -151,6 +154,25 @@ const retryer = async <TData = unknown>(
           message?: unknown;
         };
 
+        // Rate-limit responses never get quick retries. GitHub expects
+        // clients to honor Retry-After or the reset time, so the only safe
+        // move is to rotate to the next PAT. HTTP 429 and rate-limit 403
+        // answers both carry this meaning.
+        const status = e.response?.status;
+        const carriesRateLimitMessage = /rate limit/i.test(
+          e.response?.data.message ?? "",
+        );
+        const isRateLimitResponse =
+          status === 429 || (status === 403 && carriesRateLimitMessage);
+
+        if (isRateLimitResponse && e.response) {
+          logger.log(
+            `${currentPAT.name} hit a rate limit (HTTP ${status}), rotating`,
+          );
+          lastFailureKind = "rate-limit";
+          break; // rotate to next PAT
+        }
+
         // Transient failure: network-level error without a response, or a
         // retryable HTTP status. Retry the same PAT with backoff before
         // rotating to the next token.
@@ -202,7 +224,7 @@ const retryer = async <TData = unknown>(
   if (lastFailureKind === "transient" && lastTransientError instanceof Error) {
     reason = `GitHub API request failed after transient retries: ${lastTransientError.message}`;
   } else if (lastFailureKind === "credential") {
-    reason = "GitHub API request failed: all GitHub tokens were rejected";
+    reason = "GitHub API request failed due to invalid credentials";
   }
 
   throw new CustomError(reason, CustomError.MAX_RETRY);

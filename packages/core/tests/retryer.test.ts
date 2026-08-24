@@ -227,8 +227,40 @@ describe("Test Retryer", () => {
 
     await expect(
       retryer(fetcherMixed, {}, undefined, { transientRetryDelaysMs: [] }),
-    ).rejects.toThrow("all GitHub tokens were rejected");
+    ).rejects.toThrow("GitHub API request failed due to invalid credentials");
 
     randomSpy.mockRestore();
+  });
+
+  it("retryer should not quick-retry HTTP 429 and report rate limiting", async () => {
+    const fetcher429 = vi.fn().mockRejectedValue(httpError(429));
+
+    await expect(
+      retryer(fetcher429 as unknown as Fetcher, {}, "user-pat-token", {
+        transientRetryDelaysMs: [0],
+      }),
+    ).rejects.toThrow("Downtime due to GitHub API rate limiting");
+
+    expect(fetcher429).toHaveBeenCalledTimes(1);
+  });
+
+  it("retryer should treat a rate-limit 403 like a rate limit", async () => {
+    const fetcher403 = vi.fn().mockRejectedValue(
+      Object.assign(new Error("http error"), {
+        isAxiosError: true,
+        response: {
+          status: 403,
+          data: { message: "API rate limit exceeded for ..." },
+        },
+      }),
+    );
+
+    await expect(
+      retryer(fetcher403 as unknown as Fetcher, {}, "user-pat-token", {
+        transientRetryDelaysMs: [0],
+      }),
+    ).rejects.toThrow("Downtime due to GitHub API rate limiting");
+
+    expect(fetcher403).toHaveBeenCalledTimes(1);
   });
 });
