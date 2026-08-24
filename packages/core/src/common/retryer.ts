@@ -29,6 +29,50 @@ function getRandomInt(max: number): number {
 }
 
 /**
+ * Delay before each transient retry of the same PAT.
+ *
+ * Transient failures are network-level errors (ECONNRESET, ETIMEDOUT,
+ * socket hang up) and retryable HTTP statuses. Token rotation stays
+ * separate from this backoff.
+ */
+const TRANSIENT_RETRY_DELAYS_MS = [1000, 2000, 4000];
+
+/** Random extra wait added to each transient retry delay. */
+const TRANSIENT_RETRY_JITTER_MS = 250;
+
+/**
+ * HTTP statuses worth a same-token retry. Server-side blips only.
+ * 429 and rate-limit 403 answers skip quick retries entirely: hammering a
+ * limited token violates GitHub's Retry-After / reset guidance and can get
+ * the token blocked. Permanent statuses such as 401/404/422 stay outside
+ * this set.
+ */
+const RETRYABLE_HTTP_STATUS_CODES = new Set([502, 503, 504]);
+
+/**
+ * Wait for `ms` milliseconds.
+ */
+const sleep = (ms: number): Promise<void> => {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+};
+
+/**
+ * Optional overrides for {@link retryer}, mainly for tests.
+ */
+interface RetryerOptions {
+  /**
+   * Delays between transient retries of one PAT.
+   * An empty array disables transient retries.
+   */
+  transientRetryDelaysMs?: Array<number>;
+}
+
+/**
+ * Kind of the failure that caused the latest PAT rotation.
+ */
+type FailureKind = "transient" | "rate-limit" | "credential";
+
+/**
  * A fetcher's Axios response. `TData` is the shape of `response.data`,
  * which is intersected with {@link ResponseErrors} so the retryer can inspect
  * `errors`/`message`.
@@ -55,6 +99,7 @@ const retryer = async <TData = unknown>(
   fetcher: FetcherFunction<TData>,
   variables: Record<string, unknown>,
   pat: string | null = null,
+  { transientRetryDelaysMs = TRANSIENT_RETRY_DELAYS_MS }: RetryerOptions = {},
 ): Promise<FetcherResponse<TData>> => {
   const PATs = pat
     ? [{ name: "user PAT from database", value: pat }]
@@ -65,61 +110,124 @@ const retryer = async <TData = unknown>(
   }
   const startPAT = getRandomInt(PATs.length);
 
+  let lastTransientError: unknown = null;
+  // Kind of the most recent rotation. The final message reflects the last
+  // observed failure, not the first one.
+  let lastFailureKind: FailureKind | null = null;
+
   for (let retries = 0; retries < PATs.length; retries++) {
     const currentPAT = PATs[(startPAT + retries) % PATs.length];
     if (!currentPAT) {
       continue;
     }
 
-    try {
-      const response = await fetcher(
-        variables,
-        currentPAT.value,
-        // used in tests for faking rate limit
-        retries,
-      );
+    // One transient retry per delay entry. The last pass has no delay left
+    // and rotates to the next PAT instead.
+    for (let attempt = 0; attempt <= transientRetryDelaysMs.length; attempt++) {
+      try {
+        const response = await fetcher(
+          variables,
+          currentPAT.value,
+          // used in tests for faking rate limit
+          retries,
+        );
 
-      // react on both type and message-based rate-limit signals.
-      // https://github.com/anuraghazra/github-readme-stats/issues/4425
-      const errors = response.data.errors;
-      const errorType = errors?.[0]?.type;
-      const errorMsg = errors?.[0]?.message ?? "";
-      const isRateLimited =
-        (!!errors && errorType === "RATE_LIMITED") ||
-        /rate limit/i.test(errorMsg);
+        // react on both type and message-based rate-limit signals.
+        // https://github.com/anuraghazra/github-readme-stats/issues/4425
+        const errors = response.data.errors;
+        const errorType = errors?.[0]?.type;
+        const errorMsg = errors?.[0]?.message ?? "";
+        const isRateLimited =
+          (!!errors && errorType === "RATE_LIMITED") ||
+          /rate limit/i.test(errorMsg);
 
-      if (isRateLimited) {
-        logger.log(`${currentPAT.name} Failed due to rate limiting`);
-      } else {
+        if (isRateLimited) {
+          logger.log(`${currentPAT.name} Failed due to rate limiting`);
+          lastFailureKind = "rate-limit";
+          break; // rotate to next PAT
+        }
         return response;
-      }
-    } catch (err) {
-      const e = err as { response?: FetcherResponse<TData> };
+      } catch (err) {
+        const e = err as {
+          response?: FetcherResponse<TData>;
+          isAxiosError?: boolean;
+          message?: unknown;
+        };
 
-      // network/unexpected error → let caller treat as failure
-      if (!e.response) {
-        throw err;
-      }
+        // Rate-limit responses never get quick retries. Quick retries would
+        // violate GitHub's Retry-After / reset guidance and can get the
+        // token blocked, so rotate to the next PAT instead. HTTP 429 and
+        // rate-limit 403 answers both carry this meaning.
+        const status = e.response?.status;
+        const carriesRateLimitMessage = /rate limit/i.test(
+          e.response?.data.message ?? "",
+        );
+        const isRateLimitResponse =
+          status === 429 || (status === 403 && carriesRateLimitMessage);
 
-      // also checking for bad credentials if any tokens gets invalidated
-      const message = e.response.data.message;
-      const isBadCredential = message === "Bad credentials";
-      const isAccountSuspended =
-        message === "Sorry. Your account was suspended.";
+        if (isRateLimitResponse && e.response) {
+          logger.log(
+            `${currentPAT.name} hit a rate limit (HTTP ${status}), rotating`,
+          );
+          lastFailureKind = "rate-limit";
+          break; // rotate to next PAT
+        }
 
-      if (isBadCredential || isAccountSuspended) {
-        logger.log(`${currentPAT.name} Failed due to bad credentials`);
-      } else {
+        // Transient failure: network-level error without a response, or a
+        // retryable HTTP status. Retry the same PAT with backoff before
+        // rotating to the next token.
+        const isTransient =
+          (!e.response && e.isAxiosError === true) ||
+          (!!e.response && RETRYABLE_HTTP_STATUS_CODES.has(e.response.status));
+
+        if (isTransient) {
+          lastTransientError = err;
+          lastFailureKind = "transient";
+          const delayMs = transientRetryDelaysMs[attempt];
+          if (delayMs !== undefined) {
+            logger.log(
+              `${currentPAT.name} transient failure (${String(e.message)}), retrying`,
+            );
+            await sleep(delayMs + getRandomInt(TRANSIENT_RETRY_JITTER_MS));
+            continue;
+          }
+          break; // retries exhausted → rotate to next PAT
+        }
+
+        // non-axios errors are bugs, not transient failures
+        if (!e.response) {
+          throw err;
+        }
+
+        // also checking for bad credentials if any tokens gets invalidated
+        const message = e.response.data.message;
+        const isBadCredential = message === "Bad credentials";
+        const isAccountSuspended =
+          message === "Sorry. Your account was suspended.";
+
+        if (isBadCredential || isAccountSuspended) {
+          logger.log(`${currentPAT.name} Failed due to bad credentials`);
+          lastFailureKind = "credential";
+          break; // rotate to next PAT
+        }
+
         // HTTP error with a response → return it for caller-side handling
         return e.response;
       }
     }
   }
 
-  throw new CustomError(
-    "Downtime due to GitHub API rate limiting",
-    CustomError.MAX_RETRY,
-  );
+  // The final message reflects the last failure kind. Claiming "rate
+  // limiting" without a rate limit would mislead the reader. A missing kind
+  // means no PAT slot was usable; keep the historical message there.
+  let reason = "Downtime due to GitHub API rate limiting";
+  if (lastFailureKind === "transient" && lastTransientError instanceof Error) {
+    reason = `GitHub API request failed after transient retries: ${lastTransientError.message}`;
+  } else if (lastFailureKind === "credential") {
+    reason = "GitHub API request failed due to invalid credentials";
+  }
+
+  throw new CustomError(reason, CustomError.MAX_RETRY);
 };
 
 export { retryer };
