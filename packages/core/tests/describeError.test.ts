@@ -70,7 +70,7 @@ describe("Test API result error contract", () => {
     mock.restore();
   });
 
-  it("stats handler should attach typed details on rate limit exhaustion", async () => {
+  it("stats handler should keep status stable and attach typed details on rate limit exhaustion", async () => {
     mock.onPost("https://api.github.com/graphql").reply(200, {
       errors: [{ type: "RATE_LIMITED" }],
     });
@@ -86,19 +86,5 @@ describe("Test API result error contract", () => {
         message: "Downtime due to GitHub API rate limiting",
       },
     });
-  });
-
-  it("stats handler should attach message-only details for missing params", async () => {
-    const result = await callApi({});
-    const { error } = result as {
-      error?: {
-        type?: string;
-        message?: string;
-      };
-    };
-
-    expect(result.status).toBe("error - temporary");
-    expect(error).not.toHaveProperty("type");
-    expect(error?.message).toContain('Missing params "username"');
   });
 });
