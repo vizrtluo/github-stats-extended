@@ -168,8 +168,26 @@ describe("Test Retryer", () => {
       retryer(fetcherAlwaysFails as unknown as Fetcher, {}, "user-pat-token", {
         transientRetryDelaysMs: [],
       }),
-    ).rejects.toThrow("last transient error: network error");
+    ).rejects.toThrow(
+      "GitHub API request failed after transient retries: network error",
+    );
 
     expect(fetcherAlwaysFails).toHaveBeenCalledTimes(1);
+  });
+
+  it("retryer should not claim rate limiting when only transient errors occurred", async () => {
+    const fetcherAlwaysFails = vi.fn().mockRejectedValue(httpError(503));
+
+    const promise = retryer(
+      fetcherAlwaysFails as unknown as Fetcher,
+      {},
+      "user-pat-token",
+      { transientRetryDelaysMs: [] },
+    );
+
+    await expect(promise).rejects.toThrow(
+      /GitHub API request failed after transient retries/,
+    );
+    await expect(promise).rejects.not.toThrow(/rate limiting/i);
   });
 });

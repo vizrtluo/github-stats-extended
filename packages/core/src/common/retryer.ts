@@ -184,9 +184,12 @@ const retryer = async <TData = unknown>(
     }
   }
 
+  // Rate-limit rotation exhaustion keeps the historical message. Transient
+  // exhaustion reports the real cause, since claiming "rate limiting" would
+  // mislead when no rate limit was observed.
   throw new CustomError(
     lastTransientError instanceof Error
-      ? `Downtime due to GitHub API rate limiting (last transient error: ${lastTransientError.message})`
+      ? `GitHub API request failed after transient retries: ${lastTransientError.message}`
       : "Downtime due to GitHub API rate limiting",
     CustomError.MAX_RETRY,
   );
