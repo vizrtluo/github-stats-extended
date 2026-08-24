@@ -14,6 +14,22 @@ vi.mock(import("../src/common/log.js"), async () => {
   return createLoggerMock();
 });
 
+// The handler is a JS function whose inferred options type spells out every
+// query parameter. Tests pass partial query maps on purpose and only assert
+// the parts of the result they care about, so they call through this
+// deliberately narrowed view instead of the raw inferred signature.
+interface TestApiResult {
+  status: string;
+  error?: {
+    type?: string;
+    message?: string;
+  };
+  content: string;
+}
+const callApi = (options: Record<string, unknown>): Promise<TestApiResult> => {
+  return api(options as Parameters<typeof api>[0]);
+};
+
 describe("Test describeError", () => {
   it("should return message only for errors without a type", () => {
     expect(describeError(new Error("boom"))).toStrictEqual({
@@ -59,7 +75,7 @@ describe("Test API result error contract", () => {
       errors: [{ type: "RATE_LIMITED" }],
     });
 
-    const result = await api({ username: "octocat" });
+    const result = await callApi({ username: "octocat" });
 
     // status keeps its exact value for comparisons in apps/backend/router.js
     expect(result.status).toBe("error - temporary");
@@ -73,9 +89,12 @@ describe("Test API result error contract", () => {
   });
 
   it("stats handler should attach message-only details for missing params", async () => {
-    const result = await api({});
+    const result = await callApi({});
     const { error } = result as {
-      error?: Partial<Record<string, string>>;
+      error?: {
+        type?: string;
+        message?: string;
+      };
     };
 
     expect(result.status).toBe("error - temporary");
