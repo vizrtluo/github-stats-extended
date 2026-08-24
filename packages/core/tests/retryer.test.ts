@@ -190,4 +190,45 @@ describe("Test Retryer", () => {
     );
     await expect(promise).rejects.not.toThrow(/rate limiting/i);
   });
+
+  it("retryer should report rate limiting when the last rotation hit a rate limit", async () => {
+    // pin the rotation start to the first PAT
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
+    const fetcherMixed = vi.fn((_vars, _token, retries) => {
+      if (retries === 0) {
+        return Promise.reject(networkError());
+      }
+      return Promise.resolve({ data: { errors: [{ type: "RATE_LIMITED" }] } });
+    }) as unknown as Fetcher;
+
+    await expect(
+      retryer(fetcherMixed, {}, undefined, { transientRetryDelaysMs: [] }),
+    ).rejects.toThrow("Downtime due to GitHub API rate limiting");
+
+    expect(fetcherMixed).toHaveBeenCalledTimes(2);
+    randomSpy.mockRestore();
+  });
+
+  it("retryer should report credential failure when the last rotation had bad credentials", async () => {
+    // pin the rotation start to the first PAT
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
+    const fetcherMixed = vi.fn((_vars, _token, retries) => {
+      if (retries === 0) {
+        return Promise.reject(networkError());
+      }
+      // GitHub answers 401 for bad credentials, so axios rejects
+      return Promise.reject(
+        Object.assign(new Error("http error"), {
+          isAxiosError: true,
+          response: { status: 401, data: { message: "Bad credentials" } },
+        }),
+      );
+    }) as unknown as Fetcher;
+
+    await expect(
+      retryer(fetcherMixed, {}, undefined, { transientRetryDelaysMs: [] }),
+    ).rejects.toThrow("all GitHub tokens were rejected");
+
+    randomSpy.mockRestore();
+  });
 });

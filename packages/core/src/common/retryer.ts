@@ -65,6 +65,11 @@ interface RetryerOptions {
 }
 
 /**
+ * Kind of the failure that caused the latest PAT rotation.
+ */
+type FailureKind = "transient" | "rate-limit" | "credential";
+
+/**
  * A fetcher's Axios response. `TData` is the shape of `response.data`,
  * which is intersected with {@link ResponseErrors} so the retryer can inspect
  * `errors`/`message`.
@@ -103,6 +108,9 @@ const retryer = async <TData = unknown>(
   const startPAT = getRandomInt(PATs.length);
 
   let lastTransientError: unknown = null;
+  // Kind of the most recent rotation. The final message reflects the last
+  // observed failure, not the first one.
+  let lastFailureKind: FailureKind | null = null;
 
   for (let retries = 0; retries < PATs.length; retries++) {
     const currentPAT = PATs[(startPAT + retries) % PATs.length];
@@ -132,6 +140,7 @@ const retryer = async <TData = unknown>(
 
         if (isRateLimited) {
           logger.log(`${currentPAT.name} Failed due to rate limiting`);
+          lastFailureKind = "rate-limit";
           break; // rotate to next PAT
         }
         return response;
@@ -151,6 +160,7 @@ const retryer = async <TData = unknown>(
 
         if (isTransient) {
           lastTransientError = err;
+          lastFailureKind = "transient";
           const delayMs = transientRetryDelaysMs[attempt];
           if (delayMs !== undefined) {
             logger.log(
@@ -175,6 +185,7 @@ const retryer = async <TData = unknown>(
 
         if (isBadCredential || isAccountSuspended) {
           logger.log(`${currentPAT.name} Failed due to bad credentials`);
+          lastFailureKind = "credential";
           break; // rotate to next PAT
         }
 
@@ -184,15 +195,17 @@ const retryer = async <TData = unknown>(
     }
   }
 
-  // Rate-limit rotation exhaustion keeps the historical message. Transient
-  // exhaustion reports the real cause, since claiming "rate limiting" would
-  // mislead when no rate limit was observed.
-  throw new CustomError(
-    lastTransientError instanceof Error
-      ? `GitHub API request failed after transient retries: ${lastTransientError.message}`
-      : "Downtime due to GitHub API rate limiting",
-    CustomError.MAX_RETRY,
-  );
+  // The final message reflects the last failure kind. Claiming "rate
+  // limiting" without a rate limit would mislead the reader. A missing kind
+  // means no PAT slot was usable; keep the historical message there.
+  let reason = "Downtime due to GitHub API rate limiting";
+  if (lastFailureKind === "transient" && lastTransientError instanceof Error) {
+    reason = `GitHub API request failed after transient retries: ${lastTransientError.message}`;
+  } else if (lastFailureKind === "credential") {
+    reason = "GitHub API request failed: all GitHub tokens were rejected";
+  }
+
+  throw new CustomError(reason, CustomError.MAX_RETRY);
 };
 
 export { retryer };
